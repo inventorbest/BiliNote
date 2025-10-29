@@ -6,10 +6,8 @@ from typing import Optional
 from app.downloaders.base import Downloader
 from app.enmus.note_enums import DownloadQuality
 from app.models.audio_model import AudioDownloadResult
-import os
-import subprocess
-
 from app.utils.video_helper import save_cover_to_static
+from ffmpeg_helper import make_ffmpeg_command
 
 
 class LocalDownloader(Downloader, ABC):
@@ -35,16 +33,24 @@ class LocalDownloader(Downloader, ABC):
         output_path = os.path.join(output_dir, f"{base_name}_cover.jpg")
 
         try:
-            command = [
-                'ffmpeg',
+            cmd_args = [
                 '-i', input_path,
                 '-ss', '00:00:01',  # 跳到视频第1秒，防止黑屏
                 '-vframes', '1',  # 只截取一帧
                 '-q:v', '2',  # 输出质量高一点（qscale，2是很高）
-                '-y',  # 覆盖
+                '-y',
                 output_path
             ]
-            subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            command, used_cuda = make_ffmpeg_command(cmd_args)
+            try:
+                subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            except subprocess.CalledProcessError as exc:
+                if used_cuda:
+                    fallback_command, _ = make_ffmpeg_command(cmd_args, prefer_cuda=False)
+                    print("CUDA hwaccel failed, retrying without CUDA:", fallback_command)
+                    subprocess.run(fallback_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                else:
+                    raise exc
 
             if not os.path.exists(output_path):
                 raise RuntimeError(f"封面图片生成失败: {output_path}")
@@ -67,17 +73,25 @@ class LocalDownloader(Downloader, ABC):
             base, _ = os.path.splitext(input_path)
             output_path = base + ".mp3"
         try:
-        # 调用 ffmpeg 转换
-            command = [
-                'ffmpeg',
+            # 调用 ffmpeg 转换
+            cmd_args = [
                 '-i', input_path,
                 '-vn',  # 不要视频流
                 '-acodec', 'libmp3lame',  # 使用mp3编码
-                '-y',  # 覆盖输出文件
+                '-y',
                 output_path
             ]
 
-            subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            command, used_cuda = make_ffmpeg_command(cmd_args)
+            try:
+                subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            except subprocess.CalledProcessError as exc:
+                if used_cuda:
+                    fallback_command, _ = make_ffmpeg_command(cmd_args, prefer_cuda=False)
+                    print("CUDA hwaccel failed, retrying without CUDA:", fallback_command)
+                    subprocess.run(fallback_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                else:
+                    raise exc
 
             if not os.path.exists(output_path):
                 raise RuntimeError(f"mp3 文件生成失败: {output_path}")

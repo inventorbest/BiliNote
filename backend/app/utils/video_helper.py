@@ -5,13 +5,17 @@ from dotenv import load_dotenv
 import subprocess
 import os
 import uuid
+from ffmpeg_helper import make_ffmpeg_command
+
 load_dotenv()
 api_path = os.getenv("API_BASE_URL", "http://localhost")
-BACKEND_PORT= os.getenv("BACKEND_PORT", 8483)
+BACKEND_PORT = os.getenv("BACKEND_PORT", 8483)
+
 
 BACKEND_BASE_URL = f"{api_path}:{BACKEND_PORT}"
 
 from typing import Optional
+
 def generate_screenshot(video_path: str, output_dir: str, timestamp: int, index: int) -> str:
     """
     使用 ffmpeg 生成截图，返回生成图片路径
@@ -22,8 +26,7 @@ def generate_screenshot(video_path: str, output_dir: str, timestamp: int, index:
     filename = f"screenshot_{index:03}_{uuid.uuid4()}.jpg"
     output_path = output_dir / filename
 
-    command = [
-        "ffmpeg",
+    base_args = [
         "-ss", str(timestamp),
         "-i", str(video_path),
         "-frames:v", "1",
@@ -32,14 +35,23 @@ def generate_screenshot(video_path: str, output_dir: str, timestamp: int, index:
         "-y"
     ]
 
+    command, used_cuda = make_ffmpeg_command(base_args)
+
     print("Running command:", command)
     result = subprocess.run(command, capture_output=True, text=False)
 
     if result.returncode != 0:
-        stderr_text = ""
-        if result.stderr:
-            stderr_text = result.stderr.decode("utf-8", errors="ignore")
-        print("ffmpeg failed:", stderr_text)
+        if used_cuda:
+            # Retry without CUDA when the accelerated path is unsupported on the current host.
+            fallback_command, _ = make_ffmpeg_command(base_args, prefer_cuda=False)
+            print("CUDA hwaccel failed, retrying without CUDA:", fallback_command)
+            result = subprocess.run(fallback_command, capture_output=True, text=False)
+
+        if result.returncode != 0:
+            stderr_text = ""
+            if result.stderr:
+                stderr_text = result.stderr.decode("utf-8", errors="ignore")
+            print("ffmpeg failed:", stderr_text)
 
     return str(output_path)
 

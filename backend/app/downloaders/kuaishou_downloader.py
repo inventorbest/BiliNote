@@ -10,6 +10,7 @@ from app.downloaders.kuaishou_helper.kuaishou import KuaiShou
 from app.enmus.note_enums import DownloadQuality
 from app.models.audio_model import AudioDownloadResult
 from app.utils.path_helper import get_data_dir
+from ffmpeg_helper import make_ffmpeg_command
 
 
 class KuaiShouDownloader(Downloader, ABC):
@@ -64,9 +65,17 @@ class KuaiShouDownloader(Downloader, ABC):
 
         # 使用 ffmpeg 转换为 mp3
         try:
-            subprocess.run([
-                "ffmpeg", "-y", "-i", mp4_path, "-vn", "-acodec", "libmp3lame", mp3_path
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cmd_args = ["-y", "-i", mp4_path, "-vn", "-acodec", "libmp3lame", mp3_path]
+            command, used_cuda = make_ffmpeg_command(cmd_args)
+            try:
+                subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as exc:
+                if used_cuda:
+                    fallback_command, _ = make_ffmpeg_command(cmd_args, prefer_cuda=False)
+                    print("CUDA hwaccel failed, retrying without CUDA:", fallback_command)
+                    subprocess.run(fallback_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    raise exc
         except subprocess.CalledProcessError:
             raise Exception("ffmpeg 转换 MP3 失败")
 

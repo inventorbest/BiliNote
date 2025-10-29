@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from app.utils.logger import get_logger
 from app.utils.path_helper import get_app_dir
+from ffmpeg_helper import make_ffmpeg_command
 
 logger = get_logger(__name__)
 class VideoReader:
@@ -54,9 +55,24 @@ class VideoReader:
             for ts in timestamps:
                 time_label = self.format_time(ts)
                 output_path = os.path.join(self.frame_dir, f"frame_{time_label}.jpg")
-                cmd = ["ffmpeg", "-ss", str(ts), "-i", self.video_path, "-frames:v", "1", "-q:v", "2", "-y", output_path,
-                       "-hide_banner", "-loglevel", "error"]
-                subprocess.run(cmd, check=True)
+                cmd_args = [
+                    "-ss", str(ts),
+                    "-i", self.video_path,
+                    "-frames:v", "1",
+                    "-q:v", "2",
+                    "-y", output_path,
+                    "-hide_banner", "-loglevel", "error"
+                ]
+                command, used_cuda = make_ffmpeg_command(cmd_args)
+                try:
+                    subprocess.run(command, check=True)
+                except subprocess.CalledProcessError as exc:
+                    if used_cuda:
+                        fallback_command, _ = make_ffmpeg_command(cmd_args, prefer_cuda=False)
+                        logger.warning("CUDA hwaccel failed, retrying without CUDA: %s", fallback_command)
+                        subprocess.run(fallback_command, check=True)
+                    else:
+                        raise exc
                 image_paths.append(output_path)
             return image_paths
         except Exception as e:

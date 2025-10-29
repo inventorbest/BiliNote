@@ -1,11 +1,16 @@
 import os
 import subprocess
+from typing import List, Sequence, Tuple
+
 from dotenv import load_dotenv
 
 from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 load_dotenv()
+
+
+FFMPEG_ENABLE_CUDA = os.getenv("FFMPEG_ENABLE_CUDA", "false").lower() in {"1", "true", "yes", "on"}
 def check_ffmpeg_exists() -> bool:
     """
     检查 ffmpeg 是否可用。优先使用 FFMPEG_BIN_PATH 环境变量指定的路径。
@@ -22,6 +27,19 @@ def check_ffmpeg_exists() -> bool:
     except (FileNotFoundError, OSError, subprocess.CalledProcessError):
         logger.info("ffmpeg 未安装")
         return False
+
+
+def make_ffmpeg_command(args: Sequence[str], prefer_cuda: bool = True) -> Tuple[List[str], bool]:
+    """Return an ffmpeg command list and whether CUDA hwaccel is included."""
+    use_cuda = prefer_cuda and FFMPEG_ENABLE_CUDA
+    if use_cuda:
+        return ["ffmpeg", "-hwaccel", "cuda", *args], True
+    return ["ffmpeg", *args], False
+
+
+def ffmpeg_cuda_enabled() -> bool:
+    """Expose whether CUDA acceleration is globally enabled via env."""
+    return FFMPEG_ENABLE_CUDA
 
 
 def ensure_ffmpeg_or_raise():

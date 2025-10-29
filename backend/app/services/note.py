@@ -1,7 +1,10 @@
 import json
 import logging
+import math
 import os
+import random
 import re
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional, Tuple, Union, Any
@@ -53,6 +56,36 @@ NOTE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_OUTPUT_DIR = os.getenv("OUT_DIR", "./static/screenshots")
 # 图片基础 URL（用于生成 Markdown 中的图片链接，需前端静态目录对应）
 IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "/static/screenshots")
+
+# 控制单次 GPT 请求的最大文本规模，超出则自动分段汇总
+try:
+    MAX_GPT_SEGMENT_CHARS = int(os.getenv("GPT_MAX_SEGMENT_CHARS", "8000"))
+except ValueError:
+    MAX_GPT_SEGMENT_CHARS = 8000
+
+try:
+    MAX_GPT_RETRIES = int(os.getenv("GPT_MAX_RETRIES", "4"))
+except ValueError:
+    MAX_GPT_RETRIES = 4
+
+try:
+    GPT_RETRY_BASE_DELAY = float(os.getenv("GPT_RETRY_BASE_DELAY", "1.5"))
+except ValueError:
+    GPT_RETRY_BASE_DELAY = 1.5
+
+try:
+    GPT_CHUNK_SUMMARY_MAX_CHARS = int(os.getenv("GPT_CHUNK_SUMMARY_MAX_CHARS", "350"))
+except ValueError:
+    GPT_CHUNK_SUMMARY_MAX_CHARS = 350
+
+try:
+    MAX_GPT_IMAGE_COUNT = int(os.getenv("GPT_MAX_IMAGE_COUNT", "4"))
+except ValueError:
+    MAX_GPT_IMAGE_COUNT = 4
+
+
+class GPTRequestTooLargeError(Exception):
+    """在 GPT 请求体积过大时抛出的异常。"""
 
 # 日志配置
 logger = logging.getLogger(__name__)
@@ -470,12 +503,13 @@ class NoteGenerator:
         task_id = markdown_cache_file.stem
         self._update_status(task_id, TaskStatus.SUMMARIZING)
 
+        normalized_segments = self._normalize_segments(transcript.segments or [], MAX_GPT_SEGMENT_CHARS)
         source = GPTSource(
             title=audio_meta.title,
-            segment=transcript.segments,
+            segment=normalized_segments,
             tags=audio_meta.raw_info.get("tags", []),
             screenshot=screenshot,
-            video_img_urls=video_img_urls,
+            video_img_urls=self._limit_video_images(video_img_urls),
             link=link,
             _format=formats,
             style=style,
@@ -483,7 +517,37 @@ class NoteGenerator:
         )
 
         try:
-            markdown = gpt.summarize(source)
+            segments = source.segment or []
+            if self._requires_chunking(segments):
+                markdown = self._summarize_with_chunking(
+                    audio_meta=audio_meta,
+                    base_tags=source.tags,
+                    segments=segments,
+                    gpt=gpt,
+                    screenshot=screenshot,
+                    link=link,
+                    formats=formats,
+                    style=style,
+                    extras=extras,
+                    video_img_urls=video_img_urls,
+                )
+            else:
+                try:
+                    markdown = self._safe_summarize(gpt, source)
+                except GPTRequestTooLargeError:
+                    logger.info("单段请求触发 413，自动切换为分段总结策略")
+                    markdown = self._summarize_with_chunking(
+                        audio_meta=audio_meta,
+                        base_tags=source.tags,
+                        segments=segments,
+                        gpt=gpt,
+                        screenshot=screenshot,
+                        link=link,
+                        formats=formats,
+                        style=style,
+                        extras=extras,
+                        video_img_urls=video_img_urls,
+                    )
             markdown_cache_file.write_text(markdown, encoding="utf-8")
             logger.info(f"GPT 总结并缓存成功 ({markdown_cache_file})")
             return markdown
@@ -577,3 +641,222 @@ class NoteGenerator:
             logger.info(f"已保存任务记录到数据库 (video_id={video_id}, platform={platform}, task_id={task_id})")
         except Exception as e:
             logger.error(f"保存任务记录失败：{e}")
+
+    def _requires_chunking(self, segments: List[TranscriptSegment]) -> bool:
+        """判断当前转写内容是否超过单次请求限制。"""
+        total_chars = sum(len((seg.text or "").strip()) for seg in segments)
+        if total_chars <= MAX_GPT_SEGMENT_CHARS:
+            return False
+        logger.info(
+            "转写文本长度 %.1f 超过上限 %d，启用分段总结", total_chars, MAX_GPT_SEGMENT_CHARS
+        )
+        return True
+
+    def _normalize_segments(
+        self,
+        segments: List[TranscriptSegment],
+        max_chars: int,
+    ) -> List[TranscriptSegment]:
+        """将过长的转写段落拆分，避免单段文本过大。"""
+        normalized: List[TranscriptSegment] = []
+        for seg in segments:
+            text = seg.text or ""
+            if len(text) <= max_chars:
+                normalized.append(seg)
+                continue
+
+            # 按字符数切分该段文本，保持大致的时间信息
+            piece_count = max(1, math.ceil(len(text) / max_chars))
+            duration = max(seg.end - seg.start, 0.0)
+            piece_duration = duration / piece_count if piece_count else 0.0
+            for index in range(piece_count):
+                start_idx = index * max_chars
+                end_idx = start_idx + max_chars
+                piece_text = text[start_idx:end_idx]
+                piece_start = seg.start + piece_duration * index
+                piece_end = min(seg.end, piece_start + piece_duration)
+                normalized.append(
+                    TranscriptSegment(
+                        start=piece_start,
+                        end=piece_end,
+                        text=piece_text,
+                    )
+                )
+        return normalized
+
+    def _split_segments(
+        self,
+        segments: List[TranscriptSegment],
+        max_chars: int,
+    ) -> List[List[TranscriptSegment]]:
+        """按字符数将转写片段打包成多个批次。"""
+        chunks: List[List[TranscriptSegment]] = []
+        current_chunk: List[TranscriptSegment] = []
+        current_len = 0
+
+        for seg in segments:
+            seg_len = len((seg.text or "").strip())
+            if current_chunk and current_len + seg_len > max_chars:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_len = 0
+
+            # 若单段仍然超出限制，直接单独成块
+            if seg_len > max_chars:
+                chunks.append([seg])
+                current_chunk = []
+                current_len = 0
+                continue
+
+            current_chunk.append(seg)
+            current_len += seg_len
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        if not segments:
+            return []
+
+        return chunks or [segments]
+
+    def _summarize_with_chunking(
+        self,
+        audio_meta: AudioDownloadResult,
+        base_tags: List[str],
+        segments: List[TranscriptSegment],
+        gpt: GPT,
+        screenshot: bool,
+        link: bool,
+        formats: List[str],
+        style: Optional[str],
+        extras: Optional[str],
+        video_img_urls: List[str],
+    ) -> str:
+        """通过分段摘要再二次汇总的方式，减少单次请求体积。"""
+        chunk_segments = self._split_segments(segments, MAX_GPT_SEGMENT_CHARS)
+        total_chunks = len(chunk_segments)
+        chunk_summaries: List[str] = []
+        chunk_boundaries: List[Tuple[float, float]] = []
+
+        for index, chunk in enumerate(chunk_segments, start=1):
+            chunk_extra = (
+                f"你正在处理长转写文本的第 {index}/{total_chunks} 部分。"
+                "请只输出本部分的关键信息提纲，按照时间顺序使用无序列表，每条不超过两句话。"
+                "无需生成目录、原片跳转或截图标记，保持中文输出，控制在 250 字以内。"
+            )
+            if extras:
+                chunk_extra += f"\n原始额外要求（在不冲突的情况下遵循）：{extras}"
+
+            chunk_source = GPTSource(
+                title=f"{audio_meta.title}（分段 {index}/{total_chunks}）",
+                segment=chunk,
+                tags=base_tags,
+                screenshot=False,
+                video_img_urls=[],
+                link=False,
+                _format=[],
+                style=None,
+                extras=chunk_extra,
+            )
+            summary_piece = self._safe_summarize(gpt, chunk_source)
+            summary_piece = self._trim_summary(summary_piece, max_chars=GPT_CHUNK_SUMMARY_MAX_CHARS)
+            chunk_summaries.append(summary_piece)
+            if chunk:
+                chunk_boundaries.append((chunk[0].start, chunk[-1].end))
+
+        if len(chunk_boundaries) < len(chunk_summaries):
+            for idx in range(len(chunk_boundaries), len(chunk_summaries)):
+                fallback_time = float(idx * 60)
+                chunk_boundaries.append((fallback_time, fallback_time))
+
+        if chunk_summaries:
+            per_summary_limit = max(
+                120,
+                min(
+                    GPT_CHUNK_SUMMARY_MAX_CHARS,
+                    max(120, MAX_GPT_SEGMENT_CHARS // len(chunk_summaries)),
+                ),
+            )
+            chunk_summaries = [
+                self._trim_summary(summary, max_chars=per_summary_limit)
+                for summary in chunk_summaries
+            ]
+
+        combined_segments = [
+            TranscriptSegment(
+                start=boundaries[0] if boundaries else float(idx * 60),
+                end=boundaries[1] if boundaries else float(idx * 60),
+                text=summary,
+            )
+            for idx, (summary, boundaries) in enumerate(zip(chunk_summaries, chunk_boundaries), start=1)
+        ]
+
+        final_extra = (
+            "以上文本为各分段摘要，请将它们整合为一份完整的 Markdown 笔记，"
+            "恢复合理的章节结构，并满足目录、时间戳、截图等原始格式需求。"
+        )
+        if extras:
+            final_extra += f"\n原始额外要求：{extras}"
+
+        final_source = GPTSource(
+            title=audio_meta.title,
+            segment=combined_segments,
+            tags=base_tags,
+            screenshot=screenshot,
+            video_img_urls=self._limit_video_images(video_img_urls),
+            link=link,
+            _format=formats,
+            style=style,
+            extras=final_extra,
+        )
+
+        try:
+            return self._safe_summarize(gpt, final_source)
+        except GPTRequestTooLargeError:
+            if video_img_urls:
+                logger.info("最终整合仍触发 413，尝试移除截图重新请求")
+                final_source.video_img_urls = []
+                return self._safe_summarize(gpt, final_source)
+            raise
+
+    def _safe_summarize(self, gpt: GPT, source: GPTSource) -> str:
+        """对 GPT 调用增加指数退避重试，减少短暂网络失败导致的任务中断。"""
+        last_err: Exception | None = None
+        for attempt in range(1, MAX_GPT_RETRIES + 1):
+            try:
+                return gpt.summarize(source)
+            except Exception as exc:
+                last_err = exc
+                err_text = str(exc)
+                if "413" in err_text or "Request Entity Too Large" in err_text:
+                    logger.warning("GPT 请求体积过大，终止重试：%s", err_text)
+                    raise GPTRequestTooLargeError(err_text) from exc
+                wait_seconds = GPT_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                wait_seconds += random.uniform(0, 0.5)
+                logger.warning(
+                    "GPT 调用失败（第 %d/%d 次）：%s，%.2f 秒后重试",
+                    attempt,
+                    MAX_GPT_RETRIES,
+                    exc,
+                    wait_seconds,
+                )
+                if attempt == MAX_GPT_RETRIES:
+                    break
+                time.sleep(wait_seconds)
+        raise last_err if last_err else Exception("未知的 GPT 请求错误")
+
+    def _trim_summary(self, summary: str, max_chars: Optional[int] = None) -> str:
+        """限制分段摘要长度，避免最终整合阶段再次过大。"""
+        summary = summary.strip()
+        limit = max_chars if max_chars is not None else GPT_CHUNK_SUMMARY_MAX_CHARS
+        limit = max(120, min(limit, GPT_CHUNK_SUMMARY_MAX_CHARS))
+        if len(summary) <= limit:
+            return summary
+        trimmed = summary[: limit - 20].rstrip()
+        return f"{trimmed}..."
+
+    def _limit_video_images(self, video_img_urls: List[str]) -> List[str]:
+        """限制参与 GPT 请求的图片数量，避免请求体积过大。"""
+        if not video_img_urls:
+            return []
+        return video_img_urls[:MAX_GPT_IMAGE_COUNT]
